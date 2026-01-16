@@ -75,7 +75,7 @@ namespace video {
         return;
       }
       
-      // 设置大缓冲区
+      // 设置大缓冲区成功
       int sndbuf = 4 * 1024 * 1024;
       setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (char*)&sndbuf, sizeof(sndbuf));
 

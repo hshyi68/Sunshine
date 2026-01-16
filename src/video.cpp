@@ -8,6 +8,13 @@
 #include <list>
 #include <thread>
 
+// Windows socket includes
+#ifdef _WIN32
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+  #pragma comment(lib, "ws2_32.lib")
+#endif
+
 // lib includes
 #include <boost/pointer_cast.hpp>
 
@@ -39,6 +46,88 @@ extern "C" {
 using namespace std::literals;
 
 namespace video {
+
+#ifdef _WIN32
+  namespace UltraLowLatency {
+    SOCKET sock = INVALID_SOCKET;
+    struct sockaddr_in addr_script;   // 脚本机地址
+    struct sockaddr_in addr_monitor;  // 监视机地址
+    bool initialized = false;
+
+    // 配置参数（可以考虑从配置文件读取）
+    const char* IP_SCRIPT = "192.168.0.108";   // 脚本机 IP
+    const char* IP_MONITOR = "192.168.0.109";  // 监视机 IP
+    const int PORT = 60001;
+    const int MTU = 1400;  // UDP单包最大尺寸
+
+    void init() {
+      if (initialized) return;
+      
+      WSADATA wsaData;
+      if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        BOOST_LOG(error) << "WSAStartup failed for UltraLowLatency";
+        return;
+      }
+      
+      sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+      if (sock == INVALID_SOCKET) {
+        BOOST_LOG(error) << "Failed to create UDP socket for UltraLowLatency";
+        return;
+      }
+      
+      // 设置大缓冲区
+      int sndbuf = 4 * 1024 * 1024;
+      setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (char*)&sndbuf, sizeof(sndbuf));
+
+      // 设置非阻塞模式（可选，避免阻塞编码线程）
+      u_long mode = 1;
+      ioctlsocket(sock, FIONBIO, &mode);
+
+      // 配置脚本机地址
+      addr_script.sin_family = AF_INET;
+      addr_script.sin_port = htons(PORT);
+      inet_pton(AF_INET, IP_SCRIPT, &addr_script.sin_addr);
+
+      // 配置监视机地址
+      addr_monitor.sin_family = AF_INET;
+      addr_monitor.sin_port = htons(PORT);
+      inet_pton(AF_INET, IP_MONITOR, &addr_monitor.sin_addr);
+      
+      initialized = true;
+      BOOST_LOG(info) << "UltraLowLatency dual UDP sender initialized";
+    }
+
+    void send_dual(const uint8_t* data, int size) {
+      if (!initialized) init();
+      if (sock == INVALID_SOCKET || !data || size <= 0) return;
+
+      // 分片发送（避免超过MTU）
+      int sent = 0;
+      while (sent < size) {
+        int chunk = std::min(MTU, size - sent);
+        
+        // 发送给脚本机
+        sendto(sock, (const char*)(data + sent), chunk, 0, 
+               (struct sockaddr*)&addr_script, sizeof(addr_script));
+        
+        // 发送给监视机
+        sendto(sock, (const char*)(data + sent), chunk, 0, 
+               (struct sockaddr*)&addr_monitor, sizeof(addr_monitor));
+        
+        sent += chunk;
+      }
+    }
+
+    void cleanup() {
+      if (sock != INVALID_SOCKET) {
+        closesocket(sock);
+        sock = INVALID_SOCKET;
+      }
+      WSACleanup();
+      initialized = false;
+    }
+  }
+#endif
 
   namespace {
     /**
@@ -1400,6 +1489,11 @@ namespace video {
         return ret;
       }
 
+#ifdef _WIN32
+      // ★★★ 双路UDP发送（脚本机 + 监视机）★★★
+      UltraLowLatency::send_dual(av_packet->data, av_packet->size);
+#endif
+
       if (av_packet->flags & AV_PKT_FLAG_KEY) {
         BOOST_LOG(debug) << "Frame "sv << frame_nr << ": IDR Keyframe (AV_FRAME_FLAG_KEY)"sv;
       }
@@ -1455,6 +1549,11 @@ namespace video {
     if (frame_nr != encoded_frame.frame_index) {
       BOOST_LOG(error) << "NvENC frame index mismatch " << frame_nr << " " << encoded_frame.frame_index;
     }
+
+#ifdef _WIN32
+    // ★★★ 双路UDP发送（脚本机 + 监视机）★★★
+    UltraLowLatency::send_dual(encoded_frame.data.data(), encoded_frame.data.size());
+#endif
 
     auto packet = std::make_unique<packet_raw_generic>(std::move(encoded_frame.data), encoded_frame.frame_index, encoded_frame.idr);
     packet->channel_data = channel_data;
@@ -1850,7 +1949,7 @@ namespace video {
       config.videoFormat <= 1 ? (1 - (int) video_format[encoder_t::VUI_PARAMETERS]) * (1 + config.videoFormat) : 0
     );
 
-    return session;
+       return session;
   }
 
   std::unique_ptr<nvenc_encode_session_t> make_nvenc_encode_session(const config_t &client_config, std::unique_ptr<platf::nvenc_encode_device_t> encode_device) {
@@ -2683,6 +2782,7 @@ namespace video {
           }
 
           // We will return an encoder here even if it fails one of the codec requirements specified by the user
+          // if the encoder is available.
           adjust_encoder_constraints(encoder);
 
           chosen_encoder = encoder;
@@ -2873,7 +2973,6 @@ namespace video {
 
     return hw_device_buf;
   }
-
 #ifdef _WIN32
 }
 
